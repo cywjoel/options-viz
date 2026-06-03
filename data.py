@@ -41,5 +41,5 @@ def get_chain_for_expiry(ticker_obj, expiry_str):
 
 
 def days_until(expiry_str):
-    expiry = datetime.strptime(expiry_str, "%Y-%m-%d")
-    return max((expiry - datetime.now()).days, 0)
+    expiry = datetime.strptime(expiry_str, "%Y-%m-%d").date()
+    return max((expiry - datetime.now().date()).days, 0)
