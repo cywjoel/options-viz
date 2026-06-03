@@ -7,7 +7,7 @@ from plotly.subplots import make_subplots
 import numpy as np
 
 from data import get_spot_price, get_options_chain, get_chain_for_expiry, days_until
-from pricing import black_scholes_price, decay_curve
+from pricing import black_scholes_price, decay_curve, implied_vol
 
 st.set_page_config(page_title="Options Decay Visualizer", layout="wide")
 st.title("Options Decay Visualizer")
@@ -75,13 +75,25 @@ with col3:
 
 # --- IV and parameters ---
 row = chain_df[chain_df["strike"] == strike].iloc[0]
-market_iv = row.get("impliedVolatility", 0.3)
-if market_iv is None or market_iv == 0:
-    market_iv = 0.3
 
 bid = row.get("bid", 0.0) or 0.0
 ask = row.get("ask", 0.0) or 0.0
-mid_price = (bid + ask) / 2.0
+
+if bid > 0 and ask > 0:
+    anchor_price = (bid + ask) / 2.0
+else:
+    anchor_price = row.get("lastPrice", 0.0) or 0.0
+
+dte = days_until(expiry)
+if dte == 0:
+    st.warning("This contract expires today.")
+    st.stop()
+
+market_iv = row.get("impliedVolatility", 0.0) or 0.0
+if market_iv < 0.01:
+    last_price = row.get("lastPrice", 0.0) or 0.0
+    computed_iv = implied_vol(last_price, spot, strike, dte / 365.0, 0.045, option_type)
+    market_iv = computed_iv if computed_iv is not None else 0.3
 
 st.divider()
 col_iv, col_r = st.columns(2)
@@ -92,19 +104,13 @@ with col_iv:
 with col_r:
     risk_free = st.slider("Risk-Free Rate", 0.0, 0.10, 0.045, 0.005, format="%.3f")
 
-# --- Compute decay ---
-dte = days_until(expiry)
-if dte == 0:
-    st.warning("This contract expires today.")
-    st.stop()
-
 days_remaining, prices, thetas = decay_curve(spot, strike, dte, risk_free, iv, option_type)
 days_elapsed = dte - days_remaining
 
 # Anchor the decay curve to the market mid price instead of pure BS
 bs_price_now = black_scholes_price(spot, strike, dte / 365.0, risk_free, iv, option_type)
-if bs_price_now > 0 and mid_price > 0:
-    scale = mid_price / bs_price_now
+if bs_price_now > 0 and anchor_price > 0:
+    scale = anchor_price / bs_price_now
     prices = prices * scale
     thetas = thetas * scale
 
@@ -214,7 +220,7 @@ option_prices_at_date = np.array([
     for s in stock_prices
 ])
 
-if bs_price_now > 0 and mid_price > 0:
+if bs_price_now > 0 and anchor_price > 0:
     option_prices_at_date = option_prices_at_date * scale
 
 price_fig = go.Figure()
@@ -251,6 +257,6 @@ with col_input:
     lookup_price = st.number_input("Spot Price", min_value=0.01, value=round(spot, 2), step=0.01, format="%.2f")
 with col_result:
     lookup_option = black_scholes_price(lookup_price, strike, T_selected, risk_free, iv, option_type)
-    if bs_price_now > 0 and mid_price > 0:
+    if bs_price_now > 0 and anchor_price > 0:
         lookup_option *= scale
     st.metric("Option Value", f"${lookup_option:.4f}")

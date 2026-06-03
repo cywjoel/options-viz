@@ -1,4 +1,5 @@
 import numpy as np
+from scipy.optimize import brentq
 from scipy.stats import norm
 
 
@@ -33,6 +34,23 @@ def theta(S, K, T, r, sigma, option_type="call"):
         annual_theta = common + r * K * np.exp(-r * T) * norm.cdf(-d2)
 
     return annual_theta / 365
+
+
+def implied_vol(price, S, K, T, r, option_type="call"):
+    """Back-solve Black-Scholes for the implied volatility that produces `price`.
+
+    Returns None if the solve fails (e.g. price is below intrinsic value).
+    """
+    if T <= 0 or price <= 0:
+        return None
+
+    def objective(sigma):
+        return black_scholes_price(S, K, T, r, sigma, option_type) - price
+
+    try:
+        return brentq(objective, 0.001, 10.0)
+    except ValueError:
+        return None
 
 
 def decay_curve(S, K, days_to_expiry, r, sigma, option_type="call"):
