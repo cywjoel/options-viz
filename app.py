@@ -7,7 +7,7 @@ from plotly.subplots import make_subplots
 import numpy as np
 
 from data import get_spot_price, get_options_chain, get_chain_for_expiry, days_until
-from pricing import black_scholes_price, decay_curve, implied_vol
+from pricing import black_scholes_price, decay_curve, implied_vol, stock_price_for_target
 
 st.set_page_config(page_title="Options Decay Visualizer", layout="wide")
 st.title("Options Decay Visualizer")
@@ -260,3 +260,66 @@ with col_result:
     if bs_price_now > 0 and anchor_price > 0:
         lookup_option *= scale
     st.metric("Option Value", f"${lookup_option:.4f}")
+
+# --- Profit target chart ---
+st.divider()
+st.subheader("Stock Price for Target Profit")
+
+profit_multiplier = st.number_input(
+    "Profit multiplier (n)",
+    min_value=0.01,
+    value=1.50,
+    step=0.01,
+    format="%.2f",
+    help="1.50 = 50% profit, 2.00 = 100% profit, etc.",
+)
+
+target_option_price = profit_multiplier * anchor_price
+
+# For each date, solve for the stock price that produces the target option price
+# Use unscaled BS target if we're using mid-price scaling
+if bs_price_now > 0 and anchor_price > 0:
+    bs_target = target_option_price / scale
+else:
+    bs_target = target_option_price
+
+profit_dates = []
+profit_stock_prices = []
+for i, d in enumerate(dates):
+    T_rem = (dte - int(days_elapsed[i])) / 365.0
+    result = stock_price_for_target(bs_target, strike, T_rem, risk_free, iv, option_type)
+    if result is not None:
+        profit_dates.append(d)
+        profit_stock_prices.append(result)
+
+if profit_dates:
+    profit_date_strs = [d.strftime("%d-%m-%Y") for d in profit_dates]
+    profit_price_strs = [f"${p:.2f}" for p in profit_stock_prices]
+
+    profit_fig = go.Figure()
+    profit_fig.add_trace(
+        go.Scatter(
+            x=profit_dates,
+            y=profit_stock_prices,
+            mode="lines",
+            line=dict(color="#4CAF50", width=2),
+            customdata=list(zip(profit_date_strs, profit_price_strs)),
+            hovertemplate="Date: %{customdata[0]}<br>Required Stock Price: %{customdata[1]}<extra></extra>",
+        )
+    )
+
+    profit_fig.add_hline(y=spot, line_dash="dot", line_color="grey", annotation_text="Current Spot")
+    profit_fig.add_hline(y=strike, line_dash="dot", line_color="orange", annotation_text="Strike")
+
+    profit_fig.update_layout(
+        xaxis_title="Date",
+        yaxis_title="Required Stock Price ($)",
+        height=450,
+        hovermode="x unified",
+        xaxis_tickformat="%d-%m-%Y",
+        title=f"Stock price needed for {(profit_multiplier - 1) * 100:.0f}% profit (option target: ${target_option_price:.4f})",
+    )
+
+    st.plotly_chart(profit_fig, use_container_width=True)
+else:
+    st.warning("No solution found — the target profit may be unreachable for this contract.")

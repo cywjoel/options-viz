@@ -53,6 +53,23 @@ def implied_vol(price, S, K, T, r, option_type="call"):
         return None
 
 
+def stock_price_for_target(target_price, K, T, r, sigma, option_type="call"):
+    """Find the stock price that produces `target_price` for the option.
+
+    Returns None if no solution exists (e.g. target is unreachable).
+    """
+    if target_price <= 0:
+        return None
+
+    def objective(S):
+        return black_scholes_price(S, K, T, r, sigma, option_type) - target_price
+
+    try:
+        return brentq(objective, 0.01, K * 20)
+    except ValueError:
+        return None
+
+
 def decay_curve(S, K, days_to_expiry, r, sigma, option_type="call"):
     """Return arrays of (days_remaining, price, daily_theta) from now to expiry."""
     days = np.arange(days_to_expiry, -1, -1)
