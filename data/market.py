@@ -1,5 +1,4 @@
 import yfinance as yf
-from datetime import datetime
 
 
 def get_spot_price(ticker):
@@ -38,8 +37,3 @@ def get_chain_for_expiry(ticker_obj, expiry_str):
     """Return (calls_df, puts_df) for a given expiry date string."""
     chain = ticker_obj.option_chain(expiry_str)
     return chain.calls, chain.puts
-
-
-def days_until(expiry_str):
-    expiry = datetime.strptime(expiry_str, "%Y-%m-%d").date()
-    return max((expiry - datetime.now().date()).days, 0)

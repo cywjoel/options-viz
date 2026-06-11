@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import streamlit as st
 import plotly.graph_objects as go
@@ -6,14 +7,52 @@ from plotly.subplots import make_subplots
 
 import numpy as np
 
-from data import get_spot_price, get_options_chain, get_chain_for_expiry, days_until
+from data import (
+    get_spot_price, get_options_chain, get_chain_for_expiry,
+    days_until, market_hours_remaining, now_et, ET, MARKET_CLOSE,
+    save_contract, load_contracts, remove_contract, prune_expired,
+)
 from pricing import black_scholes_price, decay_curve, implied_vol, stock_price_for_target
 
 st.set_page_config(page_title="Options Decay Visualizer", layout="wide")
 st.title("Options Decay Visualizer")
 
+# Prune expired contracts once per session
+if "_pruned" not in st.session_state:
+    removed = prune_expired()
+    st.session_state["_pruned"] = True
+    if removed:
+        st.toast(f"Removed {removed} expired contract{'s' if removed != 1 else ''}.")
+
+# --- Sidebar: saved contracts ---
+with st.sidebar:
+    st.header("Saved Contracts")
+    saved = load_contracts()
+    if not saved:
+        st.caption("No saved contracts yet.")
+    for i, c in enumerate(saved):
+        col_btn, col_del = st.columns([5, 1])
+        label = f"{c['ticker']} {c['expiry']} {c['strike']} {c['type'].upper()}"
+        with col_btn:
+            if st.button(label, key=f"load_{i}", use_container_width=True):
+                st.session_state["_load_ticker"] = c["ticker"]
+                st.session_state["_load_expiry"] = c["expiry"]
+                st.session_state["_load_type"] = c["type"]
+                st.session_state["_load_strike"] = c["strike"]
+                st.rerun()
+        with col_del:
+            if st.button("✕", key=f"del_{i}", help="Remove"):
+                remove_contract(i)
+                st.rerun()
+
+# --- Apply loaded contract from sidebar ---
+default_ticker = st.session_state.pop("_load_ticker", "AAPL")
+loaded_expiry = st.session_state.pop("_load_expiry", None)
+loaded_type = st.session_state.pop("_load_type", None)
+loaded_strike = st.session_state.pop("_load_strike", None)
+
 # --- Ticker input and data fetch ---
-ticker = st.text_input("Ticker", value="AAPL").upper().strip()
+ticker = st.text_input("Ticker", value=default_ticker).upper().strip()
 
 if not ticker:
     st.stop()
@@ -55,23 +94,40 @@ if not expiries:
     st.stop()
 
 # --- Expiry and strike selection ---
-col1, col2, col3 = st.columns(3)
+col1, col2, col3, col_save = st.columns([2, 1, 2, 1])
+
+# Determine default indices from loaded contract
+expiry_idx = 0
+if loaded_expiry and loaded_expiry in expiries:
+    expiry_idx = list(expiries).index(loaded_expiry)
+
+type_options = ["call", "put"]
+type_idx = 0
+if loaded_type and loaded_type in type_options:
+    type_idx = type_options.index(loaded_type)
 
 with col1:
-    expiry = st.selectbox("Expiry", expiries)
+    expiry = st.selectbox("Expiry", expiries, index=expiry_idx)
 
 with col2:
-    option_type = st.selectbox("Type", ["call", "put"])
+    option_type = st.selectbox("Type", type_options, index=type_idx)
 
 calls_df, puts_df = get_chain_for_expiry(ticker_obj, expiry)
 chain_df = calls_df if option_type == "call" else puts_df
 
 strikes = chain_df["strike"].tolist()
-# Default to the strike closest to spot
 default_idx = min(range(len(strikes)), key=lambda i: abs(strikes[i] - spot))
+if loaded_strike and loaded_strike in strikes:
+    default_idx = strikes.index(loaded_strike)
 
 with col3:
     strike = st.selectbox("Strike", strikes, index=default_idx)
+
+with col_save:
+    st.markdown("<br>", unsafe_allow_html=True)  # align with selectboxes
+    if st.button("Save", use_container_width=True, help="Save this contract"):
+        save_contract(ticker, expiry, option_type, strike)
+        st.rerun()
 
 # --- IV and parameters ---
 row = chain_df[chain_df["strike"] == strike].iloc[0]
@@ -85,14 +141,27 @@ else:
     anchor_price = row.get("lastPrice", 0.0) or 0.0
 
 dte = days_until(expiry)
-if dte == 0:
-    st.warning("This contract expires today.")
-    st.stop()
+is_0dte = dte == 0
+
+# For 0DTE, check if market hours remain
+if is_0dte:
+    intraday_times = market_hours_remaining(expiry)
+    if not intraday_times:
+        st.warning("This contract has expired (market is closed).")
+        st.stop()
+
+# Compute T for IV fallback — use hours for 0DTE, days otherwise
+if is_0dte:
+    close_dt = datetime.combine(now_et().date(), MARKET_CLOSE, tzinfo=ET)
+    hours_left = (close_dt - now_et()).total_seconds() / 3600
+    T_now = max(hours_left / 8766, 1e-6)  # hours to years
+else:
+    T_now = dte / 365.0
 
 market_iv = row.get("impliedVolatility", 0.0) or 0.0
 if market_iv < 0.01:
     last_price = row.get("lastPrice", 0.0) or 0.0
-    computed_iv = implied_vol(last_price, spot, strike, dte / 365.0, 0.045, option_type)
+    computed_iv = implied_vol(last_price, spot, strike, T_now, 0.045, option_type)
     market_iv = computed_iv if computed_iv is not None else 0.3
 
 st.divider()
@@ -104,19 +173,47 @@ with col_iv:
 with col_r:
     risk_free = st.slider("Risk-Free Rate", 0.0, 0.10, 0.045, 0.005, format="%.3f")
 
-days_remaining, prices, thetas = decay_curve(spot, strike, dte, risk_free, iv, option_type)
-days_elapsed = dte - days_remaining
+# --- Compute decay curve ---
+# Build x-axis labels and T values depending on daily vs intraday mode
+if is_0dte:
+    close_dt = datetime.combine(now_et().date(), MARKET_CLOSE, tzinfo=ET)
+    # T values in years for each intraday time point
+    T_values = np.array([(close_dt - t).total_seconds() / (3600 * 8766) for t in intraday_times])
+    T_values = np.maximum(T_values, 1e-6)
 
-# Anchor the decay curve to the market mid price instead of pure BS
-bs_price_now = black_scholes_price(spot, strike, dte / 365.0, risk_free, iv, option_type)
+    prices = np.array([black_scholes_price(spot, strike, t, risk_free, iv, option_type) for t in T_values])
+    # Theta per hour (annual theta / 8766)
+    from pricing import theta as bs_theta
+    thetas = np.array([bs_theta(spot, strike, t, risk_free, iv, option_type) * 365 / 8766 for t in T_values])
+
+    x_axis = intraday_times
+    x_labels = [t.strftime("%H:%M ET") for t in intraday_times]
+    x_axis_title = "Time (ET)"
+    x_tickformat = "%H:%M"
+    theta_unit = "$/hr"
+    time_label_header = "Time"
+    slider_format = lambda t: t.strftime("%H:%M ET")
+else:
+    days_remaining, prices, thetas = decay_curve(spot, strike, dte, risk_free, iv, option_type)
+    days_elapsed = dte - days_remaining
+    today = now_et().date()
+    x_axis = [today + timedelta(days=int(d)) for d in days_elapsed]
+    x_labels = [d.strftime("%d-%m-%Y") for d in x_axis]
+    x_axis_title = "Date"
+    x_tickformat = "%d-%m-%Y"
+    theta_unit = "$/day"
+    time_label_header = "Date"
+    slider_format = lambda d: d.strftime("%d-%m-%Y")
+
+# Anchor to market price
+bs_price_now = black_scholes_price(spot, strike, T_now, risk_free, iv, option_type)
 if bs_price_now > 0 and anchor_price > 0:
     scale = anchor_price / bs_price_now
     prices = prices * scale
     thetas = thetas * scale
+else:
+    scale = 1.0
 
-today = datetime.now().date()
-dates = [today + timedelta(days=int(d)) for d in days_elapsed]
-date_strs = [d.strftime("%d-%m-%Y") for d in dates]
 price_strs = [f"${p:.4f}" for p in prices]
 theta_strs = [f"${t:.4f}" for t in thetas]
 
@@ -125,37 +222,40 @@ fig = make_subplots(
     rows=2, cols=1,
     shared_xaxes=True,
     vertical_spacing=0.08,
-    subplot_titles=("Theoretical Price Decay", "Daily Theta"),
+    subplot_titles=(
+        "Theoretical Price Decay (0DTE)" if is_0dte else "Theoretical Price Decay",
+        "Hourly Theta" if is_0dte else "Daily Theta",
+    ),
 )
 
 fig.add_trace(
     go.Scatter(
-        x=dates, y=prices,
+        x=x_axis, y=prices,
         mode="lines",
         name="Price",
         line=dict(color="#2196F3", width=2),
-        customdata=list(zip(date_strs, price_strs)),
-        hovertemplate="Date: %{customdata[0]}<br>Option Price: %{customdata[1]}<extra></extra>",
+        customdata=list(zip(x_labels, price_strs)),
+        hovertemplate=f"{time_label_header}: %{{customdata[0]}}<br>Option Price: %{{customdata[1]}}<extra></extra>",
     ),
     row=1, col=1,
 )
 
 fig.add_trace(
     go.Scatter(
-        x=dates, y=thetas,
+        x=x_axis, y=thetas,
         mode="lines",
         name="Theta",
         line=dict(color="#FF5722", width=2),
-        customdata=list(zip(date_strs, theta_strs)),
-        hovertemplate="Date: %{customdata[0]}<br>Theta: %{customdata[1]}/day<extra></extra>",
+        customdata=list(zip(x_labels, theta_strs)),
+        hovertemplate=f"{time_label_header}: %{{customdata[0]}}<br>Theta: %{{customdata[1]}}/{theta_unit.split('/')[1]}<extra></extra>",
     ),
     row=2, col=1,
 )
 
-fig.update_xaxes(title_text="Date", row=2, col=1, tickformat="%d-%m-%Y")
-fig.update_xaxes(tickformat="%d-%m-%Y", row=1, col=1)
+fig.update_xaxes(title_text=x_axis_title, row=2, col=1, tickformat=x_tickformat)
+fig.update_xaxes(tickformat=x_tickformat, row=1, col=1)
 fig.update_yaxes(title_text="Option Price ($)", row=1, col=1)
-fig.update_yaxes(title_text="Theta ($/day)", row=2, col=1)
+fig.update_yaxes(title_text=f"Theta ({theta_unit})", row=2, col=1)
 
 fig.update_layout(
     height=700,
@@ -173,35 +273,44 @@ fig.update_xaxes(
 
 st.plotly_chart(fig, use_container_width=True)
 
-# --- Date slider and summary stats ---
+# --- Slider and summary stats ---
 st.divider()
 
-selected_date = st.select_slider(
-    "Select date",
-    options=dates,
-    value=dates[0],
-    format_func=lambda d: d.strftime("%d-%m-%Y"),
+selected_point = st.select_slider(
+    "Select time" if is_0dte else "Select date",
+    options=x_axis,
+    value=x_axis[0],
+    format_func=slider_format,
 )
 
-idx = dates.index(selected_date)
-selected_dte = dte - int(days_elapsed[idx])
+idx = x_axis.index(selected_point)
+
+if is_0dte:
+    close_dt = datetime.combine(now_et().date(), MARKET_CLOSE, tzinfo=ET)
+    T_selected = max((close_dt - selected_point).total_seconds() / (3600 * 8766), 1e-6)
+    time_remaining_str = f"{(close_dt - selected_point).total_seconds() / 3600:.1f} hrs"
+else:
+    selected_dte = dte - int(days_elapsed[idx])
+    T_selected = selected_dte / 365.0
+    time_remaining_str = f"{selected_dte} days"
+
 moneyness = "ITM" if (spot > strike and option_type == "call") or (spot < strike and option_type == "put") else "OTM"
 if abs(spot - strike) / spot < 0.02:
     moneyness = "ATM"
 
-st.markdown(f"### At {selected_date.strftime('%d-%m-%Y')}")
+header_text = f"At {slider_format(selected_point)}"
+st.markdown(f"### {header_text}")
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Option Price", f"${prices[idx]:.4f}")
-c2.metric("Theta", f"${thetas[idx]:.4f}/day")
-c3.metric("Days to Expiry", selected_dte)
+c2.metric("Theta", f"${thetas[idx]:.4f}/{theta_unit.split('/')[1]}")
+c3.metric("Time to Expiry", time_remaining_str)
 c4.metric("Moneyness", moneyness)
 
 # --- Price sensitivity chart ---
 st.divider()
 st.subheader("Option Price vs. Stock Price")
 
-T_selected = selected_dte / 365.0
-expected_move = spot * iv * np.sqrt(T_selected) if T_selected > 0 else spot * iv * np.sqrt(dte / 365.0)
+expected_move = spot * iv * np.sqrt(T_selected) if T_selected > 0 else spot * iv * np.sqrt(T_now)
 default_low = max(spot - 2 * expected_move, 0.01)
 default_high = spot + 2 * expected_move
 
@@ -241,12 +350,17 @@ price_fig.add_trace(
 price_fig.add_vline(x=spot, line_dash="dot", line_color="grey", annotation_text="Spot")
 price_fig.add_vline(x=strike, line_dash="dot", line_color="orange", annotation_text="Strike")
 
+sensitivity_title = (
+    f"Option price at {slider_format(selected_point)} ({time_remaining_str} to expiry)"
+    if is_0dte else
+    f"Option price at {slider_format(selected_point)} ({selected_dte} DTE)"
+)
 price_fig.update_layout(
     xaxis_title="Stock Price ($)",
     yaxis_title="Option Price ($)",
     height=450,
     hovermode="x unified",
-    title=f"Option price at {selected_date.strftime('%d-%m-%Y')} ({selected_dte} DTE)",
+    title=sensitivity_title,
 )
 
 st.plotly_chart(price_fig, use_container_width=True)
@@ -276,35 +390,46 @@ profit_multiplier = st.number_input(
 
 target_option_price = profit_multiplier * anchor_price
 
-# For each date, solve for the stock price that produces the target option price
-# Use unscaled BS target if we're using mid-price scaling
 if bs_price_now > 0 and anchor_price > 0:
     bs_target = target_option_price / scale
 else:
     bs_target = target_option_price
 
-profit_dates = []
+profit_x = []
 profit_stock_prices = []
-for i, d in enumerate(dates):
-    T_rem = (dte - int(days_elapsed[i])) / 365.0
-    result = stock_price_for_target(bs_target, strike, T_rem, risk_free, iv, option_type)
-    if result is not None:
-        profit_dates.append(d)
-        profit_stock_prices.append(result)
 
-if profit_dates:
-    profit_date_strs = [d.strftime("%d-%m-%Y") for d in profit_dates]
+if is_0dte:
+    close_dt = datetime.combine(now_et().date(), MARKET_CLOSE, tzinfo=ET)
+    for i, t_point in enumerate(intraday_times):
+        T_rem = max((close_dt - t_point).total_seconds() / (3600 * 8766), 1e-6)
+        result = stock_price_for_target(bs_target, strike, T_rem, risk_free, iv, option_type)
+        if result is not None:
+            profit_x.append(t_point)
+            profit_stock_prices.append(result)
+else:
+    for i, d in enumerate(x_axis):
+        T_rem = (dte - int(days_elapsed[i])) / 365.0
+        result = stock_price_for_target(bs_target, strike, T_rem, risk_free, iv, option_type)
+        if result is not None:
+            profit_x.append(d)
+            profit_stock_prices.append(result)
+
+if profit_x:
+    if is_0dte:
+        profit_labels = [t.strftime("%H:%M ET") for t in profit_x]
+    else:
+        profit_labels = [d.strftime("%d-%m-%Y") for d in profit_x]
     profit_price_strs = [f"${p:.2f}" for p in profit_stock_prices]
 
     profit_fig = go.Figure()
     profit_fig.add_trace(
         go.Scatter(
-            x=profit_dates,
+            x=profit_x,
             y=profit_stock_prices,
             mode="lines",
             line=dict(color="#4CAF50", width=2),
-            customdata=list(zip(profit_date_strs, profit_price_strs)),
-            hovertemplate="Date: %{customdata[0]}<br>Required Stock Price: %{customdata[1]}<extra></extra>",
+            customdata=list(zip(profit_labels, profit_price_strs)),
+            hovertemplate=f"{time_label_header}: %{{customdata[0]}}<br>Required Stock Price: %{{customdata[1]}}<extra></extra>",
         )
     )
 
@@ -312,11 +437,11 @@ if profit_dates:
     profit_fig.add_hline(y=strike, line_dash="dot", line_color="orange", annotation_text="Strike")
 
     profit_fig.update_layout(
-        xaxis_title="Date",
+        xaxis_title=x_axis_title,
         yaxis_title="Required Stock Price ($)",
         height=450,
         hovermode="x unified",
-        xaxis_tickformat="%d-%m-%Y",
+        xaxis_tickformat=x_tickformat,
         title=f"Stock price needed for {(profit_multiplier - 1) * 100:.0f}% profit (option target: ${target_option_price:.4f})",
     )
 
