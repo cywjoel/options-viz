@@ -10,14 +10,49 @@ import numpy as np
 from data import (
     get_spot_price, get_options_chain, get_chain_for_expiry,
     days_until, market_hours_remaining, now_et, ET, MARKET_CLOSE,
+    save_contract, load_contracts, remove_contract, prune_expired,
 )
 from pricing import black_scholes_price, decay_curve, implied_vol, stock_price_for_target
 
 st.set_page_config(page_title="Options Decay Visualizer", layout="wide")
 st.title("Options Decay Visualizer")
 
+# Prune expired contracts once per session
+if "_pruned" not in st.session_state:
+    removed = prune_expired()
+    st.session_state["_pruned"] = True
+    if removed:
+        st.toast(f"Removed {removed} expired contract{'s' if removed != 1 else ''}.")
+
+# --- Sidebar: saved contracts ---
+with st.sidebar:
+    st.header("Saved Contracts")
+    saved = load_contracts()
+    if not saved:
+        st.caption("No saved contracts yet.")
+    for i, c in enumerate(saved):
+        col_btn, col_del = st.columns([5, 1])
+        label = f"{c['ticker']} {c['expiry']} {c['strike']} {c['type'].upper()}"
+        with col_btn:
+            if st.button(label, key=f"load_{i}", use_container_width=True):
+                st.session_state["_load_ticker"] = c["ticker"]
+                st.session_state["_load_expiry"] = c["expiry"]
+                st.session_state["_load_type"] = c["type"]
+                st.session_state["_load_strike"] = c["strike"]
+                st.rerun()
+        with col_del:
+            if st.button("✕", key=f"del_{i}", help="Remove"):
+                remove_contract(i)
+                st.rerun()
+
+# --- Apply loaded contract from sidebar ---
+default_ticker = st.session_state.pop("_load_ticker", "AAPL")
+loaded_expiry = st.session_state.pop("_load_expiry", None)
+loaded_type = st.session_state.pop("_load_type", None)
+loaded_strike = st.session_state.pop("_load_strike", None)
+
 # --- Ticker input and data fetch ---
-ticker = st.text_input("Ticker", value="AAPL").upper().strip()
+ticker = st.text_input("Ticker", value=default_ticker).upper().strip()
 
 if not ticker:
     st.stop()
@@ -59,22 +94,40 @@ if not expiries:
     st.stop()
 
 # --- Expiry and strike selection ---
-col1, col2, col3 = st.columns(3)
+col1, col2, col3, col_save = st.columns([2, 1, 2, 1])
+
+# Determine default indices from loaded contract
+expiry_idx = 0
+if loaded_expiry and loaded_expiry in expiries:
+    expiry_idx = list(expiries).index(loaded_expiry)
+
+type_options = ["call", "put"]
+type_idx = 0
+if loaded_type and loaded_type in type_options:
+    type_idx = type_options.index(loaded_type)
 
 with col1:
-    expiry = st.selectbox("Expiry", expiries)
+    expiry = st.selectbox("Expiry", expiries, index=expiry_idx)
 
 with col2:
-    option_type = st.selectbox("Type", ["call", "put"])
+    option_type = st.selectbox("Type", type_options, index=type_idx)
 
 calls_df, puts_df = get_chain_for_expiry(ticker_obj, expiry)
 chain_df = calls_df if option_type == "call" else puts_df
 
 strikes = chain_df["strike"].tolist()
 default_idx = min(range(len(strikes)), key=lambda i: abs(strikes[i] - spot))
+if loaded_strike and loaded_strike in strikes:
+    default_idx = strikes.index(loaded_strike)
 
 with col3:
     strike = st.selectbox("Strike", strikes, index=default_idx)
+
+with col_save:
+    st.markdown("<br>", unsafe_allow_html=True)  # align with selectboxes
+    if st.button("Save", use_container_width=True, help="Save this contract"):
+        save_contract(ticker, expiry, option_type, strike)
+        st.rerun()
 
 # --- IV and parameters ---
 row = chain_df[chain_df["strike"] == strike].iloc[0]
