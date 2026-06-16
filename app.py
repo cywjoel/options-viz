@@ -116,6 +116,9 @@ calls_df, puts_df = get_chain_for_expiry(ticker_obj, expiry)
 chain_df = calls_df if option_type == "call" else puts_df
 
 strikes = chain_df["strike"].tolist()
+if not strikes:
+    st.warning("No strikes available for this expiry. Options trading may not have started yet.")
+    st.stop()
 default_idx = min(range(len(strikes)), key=lambda i: abs(strikes[i] - spot))
 if loaded_strike and loaded_strike in strikes:
     default_idx = strikes.index(loaded_strike)
